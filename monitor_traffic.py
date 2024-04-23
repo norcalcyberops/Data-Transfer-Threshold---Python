@@ -1,24 +1,123 @@
-# Data-Transfer-Threshold---Python
+import psutil
+import time
+import subprocess
+import sys
 
-Kills processes via python once a data threshold has been reached
+def install_package(package):
+	"""Install a pip package using subprocess."""
+	subprocess.check_call([sys.executable, "-m", "pip", "install", package])
 
-A script running in the background on the victim machine monitored the traffic and calculated how much data has been transferred. Once any process has uploaded more than 50 MB of data (our pre-defined threshold), the script kills the process via the process ID. The script then adds the IP associated with the killed process to a blacklist configuration file.
+# Ensure psutil is installed
+try:
+	import psutil
+except ImportError:
+	print("psutil not installed. Installing...")
+	install_package("psutil")
 
-Here’s how it works to defend against potential SSH exploits: Monitoring SSH Traffic: The script uses psutil.net_connections to monitor all active connections on the system. It filters these connections to identify those that are established via SSH (typically using port 22).
+def load_whitelisted_ips(filename="whitelist.txt"):
+	"""Load whitelisted IPs from a file, creating the file if it doesn't exist."""
+	try:
+    	with open(filename, 'r') as file:
+        	return set(line.strip() for line in file if line.strip())
+	except FileNotFoundError:
+    	print(f"Whitelist file '{filename}' not found. Creating a new one.")
+    	with open(filename, 'w'):  # Create the file
+        	pass
+    	return set()
 
-Threshold-Based Monitoring: For every SSH connection, it checks the amount of data being sent through the connection. If the data exceeds a predefined threshold (ssh_threshold), this could indicate an attempt at data exfiltration.
+def load_blacklist(filename="blacklist.txt"):
+	"""Load blacklisted IPs from a file, creating the file if it doesn't exist."""
+	try:
+    	with open(filename, 'r') as file:
+        	return set(line.strip() for line in file if line.strip())
+	except FileNotFoundError:
+    	print(f"Blacklist file '{filename}' not found. Creating a new one.")
+    	with open(filename, 'w'):
+        	pass
+    	return set()
 
-Blacklisting IPs: Further, the script adds the IP address of the terminated connection to a blacklist. This prevents any future connections from the same IP, effectively blocking repeated attempts from a known malicious source.
+def add_to_blacklist(ip, filename="blacklist.txt"):
+	"""Add an IP to the blacklist file."""
+	with open(filename, 'a') as file:
+    	file.write(f"{ip}\n")
+	print(f"Added IP {ip} to blacklist.")
 
-Dynamic Updating: The script dynamically reloads the whitelist and blacklist from file storage, allowing for quick updates to the access control lists without needing to restart the script or lose its monitoring capabilities.
+def monitor_network_usage(ssh_threshold=100 * 1024, general_threshold=50 * 1024 * 1024, whitelist_file="whitelist.txt", blacklist_file="blacklist.txt"):
+	"""Monitor network usage and selectively kill processes exceeding thresholds."""
+	net_io_start = psutil.net_io_counters(pernic=True)
+	total_uploaded = 0
+	terminated_processes = set()
+	whitelisted_ips = load_whitelisted_ips(whitelist_file)
+	blacklist = load_blacklist(blacklist_file)
 
-WEAKNESSES
+	try:
+    	while True:
+        	time.sleep(1)
+        	whitelisted_ips = load_whitelisted_ips(whitelist_file)
+        	blacklist = load_blacklist(blacklist_file)
+        	net_io_current = psutil.net_io_counters(pernic=True)
+        	session_uploaded = 0
 
-    Performance Resource Consumption: Continuously monitoring network statistics and managing files (like whitelists and blacklists) in real-time can be resource-intensive, especially on systems with high network traffic or a large number of connections.
+        	for nic, stats in net_io_current.items():
+            	if nic in net_io_start:
+                	sent_bytes = stats.bytes_sent - net_io_start[nic].bytes_sent
+                	session_uploaded += sent_bytes
 
-    Detection Evasion Advanced Evasion Techniques: Skilled attackers might use sophisticated methods to evade detection, such as slowly leaking data to stay below the threshold.
+        	total_uploaded += session_uploaded
+        	print(f"Total uploaded data: {total_uploaded / (1024 * 1024):.2f} MB")
 
-IP Spoofing: The script uses IP addresses to identify and block potentially malicious connections. IP spoofing could render the blacklist ineffective, as attackers might continually change their apparent source IP.
+        	check_ssh_connections(ssh_threshold, whitelisted_ips, terminated_processes, blacklist)
+       	 
+        	if total_uploaded > general_threshold:
+            	print("General upload threshold exceeded. Searching for processes to terminate...")
+            	terminate_relevant_processes(terminated_processes, whitelisted_ips, blacklist)
+            	net_io_start = psutil.net_io_counters(pernic=True)
+            	total_uploaded = 0  # Reset after updating net_io_start
 
-    Technical Limitations Lack of Contextual Awareness: There are currently no configurable application exclusions and all traffic is being logged across all applications. All data transfer from any application currently counts towards the data transfer threshold. There is no segmentation between applications.
+	except KeyboardInterrupt:
+    	print("Monitoring stopped by user.")
 
+def check_ssh_connections(ssh_threshold, whitelisted_ips, terminated_processes, blacklist):
+	for conn in psutil.net_connections(kind='inet'):
+    	if conn.status == 'ESTABLISHED' and conn.laddr and conn.raddr and conn.raddr.port == 22:
+        	if conn.pid in terminated_processes or conn.raddr.ip in whitelisted_ips or conn.raddr.ip in blacklist:
+            	continue
+        	process = psutil.Process(conn.pid)
+        	bytes_sent = process.io_counters().write_bytes
+        	if bytes_sent > ssh_threshold:
+            	print(f"SSH upload threshold exceeded for process {process.name()} with PID {conn.pid}.")
+            	terminate_process(process, terminated_processes, blacklist)
+
+def terminate_process(process, terminated_processes, blacklist):
+	try:
+    	if process.is_running():
+        	print(f"Terminating process {process.name()} with PID {process.pid}.")
+        	process.terminate()
+        	process.wait(timeout=3)
+        	if not process.is_running():
+            	print("Process terminated successfully.")
+            	# If possible, add the remote IP to the blacklist
+            	for conn in psutil.net_connections(kind='inet'):
+                	if conn.pid == process.pid and conn.raddr:
+                    	add_to_blacklist(conn.raddr.ip)
+        	else:
+            	print("Forcing kill...")
+            	process.kill()
+        	terminated_processes.add(process.pid)
+	except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired) as e:
+    	print(f"Could not terminate process: {e}")
+    	if process.is_running():
+        	process.kill()
+    	terminated_processes.add(process.pid)
+
+def terminate_relevant_processes(terminated_processes, whitelisted_ips, blacklist):
+	for conn in psutil.net_connections(kind='inet'):
+    	if conn.status == 'ESTABLISHED' and conn.laddr and conn.raddr:
+        	if conn.pid in terminated_processes or conn.raddr.ip in whitelisted_ips or conn.raddr.ip in blacklist:
+            	continue
+        	process = psutil.Process(conn.pid)
+        	if process.is_running():
+            	terminate_process(process, terminated_processes, blacklist)
+
+if __name__ == "__main__":
+	monitor_network_usage()
